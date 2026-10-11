@@ -1,0 +1,284 @@
+// Search Query Optimization and Analysis System
+// Build:  g++ -std=c++17 -O2 -o search_system search_system.cpp
+// Run:    ./search_system          (interactive)
+//         ./search_system demo     (scripted demo)
+//
+// Pipeline: raw query -> normalize -> stopword removal -> spell correction
+//           -> stemming -> synonym expansion -> LRU cache -> TF-IDF ranking
+//           -> query log -> analytics report. Trie powers autocomplete.
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <list>
+#include <map>
+#include <set>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+using namespace std;
+
+// ---------------------------------------------------------------- text utils
+namespace text {
+const set<string> STOP = {"a","an","the","is","are","was","were","of","in","on","at","to","for",
+                          "and","or","with","how","what","do","does","i","my","me","it","by"};
+
+string normalize(const string &s) {
+    string out;
+    for (unsigned char c : s) out += isalnum(c) ? (char)tolower(c) : ' ';
+    return out;
+}
+vector<string> tokenize(const string &s) {
+    vector<string> t; istringstream ss(normalize(s)); string w;
+    while (ss >> w) t.push_back(w);
+    return t;
+}
+string stem(string w) {  // light suffix stripping
+    auto ends = [&](const string &suf) {
+        return w.size() > suf.size() + 2 && w.compare(w.size() - suf.size(), suf.size(), suf) == 0;
+    };
+    if (ends("ing")) w.erase(w.size() - 3);
+    else if (ends("ed")) w.erase(w.size() - 2);
+    else if (ends("es")) w.erase(w.size() - 2);
+    else if (ends("s")) w.erase(w.size() - 1);
+    return w;
+}
+int editDistance(const string &a, const string &b) {
+    vector<vector<int>> d(a.size() + 1, vector<int>(b.size() + 1));
+    for (size_t i = 0; i <= a.size(); i++) d[i][0] = i;
+    for (size_t j = 0; j <= b.size(); j++) d[0][j] = j;
+    for (size_t i = 1; i <= a.size(); i++)
+        for (size_t j = 1; j <= b.size(); j++) {
+            d[i][j] = min({d[i-1][j] + 1, d[i][j-1] + 1, d[i-1][j-1] + (a[i-1] != b[j-1])});
+            if (i > 1 && j > 1 && a[i-1] == b[j-2] && a[i-2] == b[j-1])  // transposition
+                d[i][j] = min(d[i][j], d[i-2][j-2] + 1);
+        }
+    return d[a.size()][b.size()];
+}
+}  // namespace text
+
+// ---------------------------------------------------------------- trie
+class Trie {
+    struct Node { map<char, Node *> next; int freq = 0; bool end = false; };
+    Node *root = new Node();
+    void collect(Node *n, string &cur, vector<pair<string, int>> &out) {
+        if (n->end) out.push_back({cur, n->freq});
+        for (auto &[c, child] : n->next) { cur.push_back(c); collect(child, cur, out); cur.pop_back(); }
+    }
+    void destroy(Node *n) { for (auto &p : n->next) destroy(p.second); delete n; }
+public:
+    ~Trie() { destroy(root); }
+    void insert(const string &w, int inc = 1) {
+        Node *n = root;
+        for (char c : w) { if (!n->next[c]) n->next[c] = new Node(); n = n->next[c]; }
+        n->end = true; n->freq += inc;
+    }
+    vector<string> suggest(const string &prefix, size_t k = 5) {
+        Node *n = root;
+        for (char c : prefix) { auto it = n->next.find(c); if (it == n->next.end()) return {}; n = it->second; }
+        vector<pair<string, int>> all; string cur = prefix;
+        collect(n, cur, all);
+        sort(all.begin(), all.end(), [](auto &a, auto &b) { return a.second != b.second ? a.second > b.second : a.first < b.first; });
+        vector<string> r;
+        for (size_t i = 0; i < all.size() && i < k; i++) r.push_back(all[i].first);
+        return r;
+    }
+};
+
+// ---------------------------------------------------------------- LRU cache
+template <class V> class LRUCache {
+    size_t cap; list<pair<string, V>> items; unordered_map<string, typename list<pair<string, V>>::iterator> idx;
+public:
+    explicit LRUCache(size_t c) : cap(c) {}
+    bool get(const string &k, V &out) {
+        auto it = idx.find(k); if (it == idx.end()) return false;
+        items.splice(items.begin(), items, it->second); out = it->second->second; return true;
+    }
+    void put(const string &k, const V &v) {
+        auto it = idx.find(k);
+        if (it != idx.end()) { it->second->second = v; items.splice(items.begin(), items, it->second); return; }
+        items.emplace_front(k, v); idx[k] = items.begin();
+        if (items.size() > cap) { idx.erase(items.back().first); items.pop_back(); }
+    }
+};
+
+// ---------------------------------------------------------------- inverted index
+struct Document { int id; string title, body; };
+struct Result { int docId; double score; };
+
+class InvertedIndex {
+    vector<Document> docs;
+    unordered_map<string, unordered_map<int, int>> postings;  // term -> (doc -> tf)
+public:
+    void add(const string &title, const string &body) {
+        int id = docs.size(); docs.push_back({id, title, body});
+        for (auto &w : text::tokenize(title)) if (!text::STOP.count(w)) postings[text::stem(w)][id] += 2;  // title boost
+        for (auto &w : text::tokenize(body))  if (!text::STOP.count(w)) postings[text::stem(w)][id] += 1;
+    }
+    const Document &doc(int id) const { return docs[id]; }
+    size_t size() const { return docs.size(); }
+    bool has(const string &t) const { return postings.count(t) > 0; }
+    int df(const string &t) const { auto it = postings.find(t); return it == postings.end() ? 0 : it->second.size(); }
+    vector<string> vocabulary() const { vector<string> v; for (auto &p : postings) v.push_back(p.first); return v; }
+
+    // weighted terms: term -> weight (1.0 original, <1 for expansions)
+    vector<Result> search(const map<string, double> &terms, size_t k = 5) const {
+        unordered_map<int, double> acc;
+        for (auto &[t, w] : terms) {
+            auto it = postings.find(t); if (it == postings.end()) continue;
+            double idf = log(1.0 + (double)docs.size() / it->second.size());
+            for (auto &[d, tf] : it->second) acc[d] += w * (1.0 + log((double)tf)) * idf;
+        }
+        vector<Result> r; for (auto &[d, s] : acc) r.push_back({d, s});
+        sort(r.begin(), r.end(), [](auto &a, auto &b) { return a.score != b.score ? a.score > b.score : a.docId < b.docId; });
+        if (r.size() > k) r.resize(k);
+        return r;
+    }
+};
+
+// ---------------------------------------------------------------- analytics
+struct QueryLog { string raw, optimized; size_t results; double micros; bool cacheHit, corrected; };
+
+class Analytics {
+    vector<QueryLog> logs;
+public:
+    void record(const QueryLog &l) { logs.push_back(l); }
+    void report() const {
+        if (logs.empty()) { cout << "No queries logged yet.\n"; return; }
+        size_t zero = 0, hits = 0, corr = 0; double total = 0, hitT = 0, missT = 0; size_t nh = 0, nm = 0;
+        map<string, int> freq;
+        for (auto &l : logs) {
+            zero += l.results == 0; hits += l.cacheHit; corr += l.corrected; total += l.micros;
+            freq[l.optimized]++;
+            if (l.cacheHit) { hitT += l.micros; nh++; } else { missT += l.micros; nm++; }
+        }
+        double n = logs.size();
+        cout << fixed << setprecision(1);
+        cout << "\n===== Query Analytics =====\n"
+             << "Total queries        : " << logs.size() << "\n"
+             << "Unique (optimized)   : " << freq.size() << "\n"
+             << "Zero-result rate     : " << 100.0 * zero / n << "%\n"
+             << "Auto-corrected       : " << 100.0 * corr / n << "%\n"
+             << "Cache hit rate       : " << 100.0 * hits / n << "%\n"
+             << "Avg latency          : " << total / n << " us\n"
+             << "  cache hit / miss   : " << (nh ? hitT / nh : 0) << " / " << (nm ? missT / nm : 0) << " us\n";
+        vector<pair<string, int>> top(freq.begin(), freq.end());
+        sort(top.begin(), top.end(), [](auto &a, auto &b) { return a.second > b.second; });
+        cout << "Top queries:\n";
+        for (size_t i = 0; i < top.size() && i < 5; i++) cout << "  " << i + 1 << ". \"" << top[i].first << "\" x" << top[i].second << "\n";
+        cout << "Zero-result queries (content gaps):\n";
+        set<string> seen;
+        for (auto &l : logs) if (l.results == 0 && seen.insert(l.optimized).second) cout << "  - \"" << l.raw << "\"\n";
+        if (seen.empty()) cout << "  (none)\n";
+        cout << "===========================\n";
+    }
+};
+
+// ---------------------------------------------------------------- search engine
+class SearchEngine {
+    InvertedIndex index; Trie trie; LRUCache<vector<Result>> cache{64}; Analytics stats;
+    vector<string> vocab;
+    map<string, vector<string>> synonyms = {
+        {"fast", {"quick", "speed"}}, {"error", {"bug", "fail"}}, {"bug", {"error", "defect"}},
+        {"database", {"db", "sql"}}, {"db", {"database"}}, {"cloud", {"aws", "server"}},
+        {"optimize", {"improve", "tune"}}, {"stock", {"equity", "share"}}, {"equity", {"stock"}}};
+
+    string correct(const string &w, bool &changed) const {
+        if (index.has(w) || w.size() < 3) return w;
+        string best = w; int bd = 3, bdf = -1;  // max edit distance 2
+        for (auto &v : vocab) {
+            if (abs((int)v.size() - (int)w.size()) > 2) continue;
+            int d = text::editDistance(w, v);
+            if (d < bd || (d == bd && index.df(v) > bdf)) { bd = d; bdf = index.df(v); best = v; }
+        }
+        if (bd <= 2 && best != w) changed = true; else best = w;
+        return best;
+    }
+public:
+    void addDocument(const string &t, const string &b) { index.add(t, b); }
+    void finalize() { vocab = index.vocabulary(); for (auto &d : vocab) trie.insert(d, index.df(d)); }
+    Analytics &analytics() { return stats; }
+    Trie &autocomplete() { return trie; }
+
+    void search(const string &raw) {
+        auto t0 = chrono::steady_clock::now();
+        bool corrected = false; vector<string> base;
+        for (auto &w : text::tokenize(raw)) {
+            if (text::STOP.count(w)) continue;
+            string s = text::stem(w); bool ch = false;
+            s = correct(s, ch); corrected |= ch; base.push_back(s);
+        }
+        sort(base.begin(), base.end()); base.erase(unique(base.begin(), base.end()), base.end());
+        string key; for (auto &b : base) key += b + " ";
+        if (!key.empty()) key.pop_back();
+
+        map<string, double> terms;
+        for (auto &b : base) terms[b] = 1.0;
+        for (auto &b : base) if (synonyms.count(b)) for (auto &s : synonyms[b]) { string st = text::stem(s); if (!terms.count(st)) terms[st] = 0.5; }
+
+        vector<Result> res; bool hit = cache.get(key, res);
+        if (!hit) { res = index.search(terms); cache.put(key, res); }
+
+        double us = chrono::duration<double, micro>(chrono::steady_clock::now() - t0).count();
+        stats.record({raw, key, res.size(), us, hit, corrected});
+
+        cout << "\nQuery: \"" << raw << "\"  ->  optimized: \"" << key << "\""
+             << (corrected ? "  [spell-corrected]" : "") << (hit ? "  [cache hit]" : "") << "\n";
+        if (res.empty()) { cout << "  No results found.\n"; return; }
+        for (auto &r : res)
+            cout << "  " << fixed << setprecision(2) << setw(5) << r.score << "  " << index.doc(r.docId).title << "\n";
+    }
+};
+
+// ---------------------------------------------------------------- main
+static void loadCorpus(SearchEngine &e) {
+    vector<pair<string, string>> docs = {
+        {"Optimizing SQL database queries", "Indexes, query plans and caching make a database fast. Tune slow SQL queries."},
+        {"Introduction to cloud computing", "Cloud platforms like AWS provide scalable servers, storage and networking."},
+        {"Building financial data pipelines", "Ingest market data, clean it, store it in a database and serve analytics."},
+        {"Equity research and stock valuation", "Discounted cash flow, ratios and valuation models for stock analysis."},
+        {"High performance C++ programming", "Memory layout, cache locality and algorithms make C++ programs fast."},
+        {"Debugging errors and bugs", "Use logs, breakpoints and tests to find an error or bug quickly."},
+        {"Search engine fundamentals", "Inverted index, TF-IDF ranking, tokenization and query processing."},
+        {"Python for data analysis", "NumPy, Pandas and Matplotlib for data cleaning and visualization."},
+        {"Backend engineering with REST APIs", "Design scalable backend services, authentication and database access."},
+        {"Quantitative trading strategies", "Backtesting, risk management and statistics for algorithmic trading."},
+        {"Caching strategies for web systems", "LRU caches, Redis and CDN reduce latency in backend systems."},
+        {"Machine learning basics", "Regression, classification and model evaluation on real data."}};
+    for (auto &d : docs) e.addDocument(d.first, d.second);
+    e.finalize();
+}
+
+int main(int argc, char **argv) {
+    SearchEngine engine; loadCorpus(engine);
+    bool demo = argc > 1 && string(argv[1]) == "demo";
+
+    if (demo) {
+        for (string q : {"how to optimize databse queries", "fast C++ programing", "stock valuaton", "cloud computing",
+                         "cloud computing", "debuging errors", "quantum teleportation", "backend cachng"})
+            engine.search(q);
+        cout << "\nAutocomplete 'ba': "; for (auto &s : engine.autocomplete().suggest("ba")) cout << s << " ";
+        cout << "\nAutocomplete 'qu': "; for (auto &s : engine.autocomplete().suggest("qu")) cout << s << " ";
+        cout << "\n"; engine.analytics().report();
+        return 0;
+    }
+
+    cout << "Search Query Optimization and Analysis System\n"
+         << "Type a query, or: :suggest <prefix> | :stats | :quit\n";
+    string line;
+    while (cout << "\n> " && getline(cin, line)) {
+        if (line == ":quit") break;
+        if (line == ":stats") { engine.analytics().report(); continue; }
+        if (line.rfind(":suggest ", 0) == 0) {
+            auto s = engine.autocomplete().suggest(line.substr(9));
+            if (s.empty()) cout << "  no suggestions\n";
+            for (auto &x : s) cout << "  " << x << "\n";
+            continue;
+        }
+        if (!line.empty()) engine.search(line);
+    }
+    engine.analytics().report();
+}
